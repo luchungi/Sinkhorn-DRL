@@ -32,7 +32,7 @@ ACTION_MAX = 1.0          # largest weight
 ROBUST = True             # True: Sinkhorn robust target; False: double DQN target
 
 EPSILON = 2e-3            # Sinkhorn radius of the ambiguity set
-DELTA = 1e-4              # Sinkhorn entropic regularisation
+DELTA = 5e-5              # Sinkhorn entropic regularisation
 NU_Y_MIN = -2.99573227355399    # lower bound of the support of nu in log returns, log(0.05)
 NU_Y_MAX = 0.667829372575655    # upper bound of the support of nu in log returns, log(1.95)
 NU_DF = 2.7818            # degrees of freedom of nu
@@ -64,9 +64,9 @@ LR = 1e-4                 # learning rate
 # Training and evaluation
 # ---------------------------------------------------------------------------
 ENV_BATCH_SIZE = 16       # paths stepped in parallel during training
-N_EPISODES = 8            # training episodes per seed
-SEED = 42                 # first seed
-N_SEEDS = 1               # number of seeds trained sequentially: SEED, SEED + 1, ...
+N_EPISODES = 5            # training episodes per seed
+SEED = 1                  # first seed
+N_SEEDS = 5               # number of seeds trained sequentially: SEED, SEED + 1, ...
 DEVICE = 'cpu'            # torch device
 
 OOS_EVERY = 1             # episodes between real-SPX backtests
