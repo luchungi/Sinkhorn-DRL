@@ -1,0 +1,6 @@
+{
+  "noise_dim": 4,
+  "seq_dim": 1,
+  "hidden_size": 64,
+  "n_lstm_layers": 1
+}
