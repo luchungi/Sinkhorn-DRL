@@ -69,6 +69,5 @@ SEED = 1                  # first seed
 N_SEEDS = 5               # number of seeds trained sequentially: SEED, SEED + 1, ...
 DEVICE = 'cpu'            # torch device
 
-OOS_EVERY = 1             # episodes between real-SPX backtests
 EVAL_BATCH_SIZE = 1000    # paths in the final evaluation on the simulator
 EVAL_SEED = 12345         # seed of the final evaluation on the simulator

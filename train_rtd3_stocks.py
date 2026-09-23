@@ -5,14 +5,15 @@ Settings are read from config_rtd3.py.
 Usage:
     python train_rtd3_stocks.py
 
-Outputs per seed in runs/<RTD3|TD3>_stocks_<timestamp>/seed<N>/:
-    run_meta.json    settings, fitted nu parameters and the feasibility check
-    val.csv          validation metrics every VAL_EVERY episodes
-    oos_monitor.csv  real-price backtest metrics every OOS_EVERY episodes
-    rtd3_<ep>.pt     agent every VAL_EVERY episodes, and rtd3_final.pt
-    oos_final.csv    final real-price backtest with benchmarks
-    val_final.csv    final validation with benchmarks
-    rtd3_final.png   wealth, weights and drawdown of the final backtest
+Outputs in runs/<RTD3|TD3>_stocks_<timestamp>/:
+    results.csv      final-weight metrics of every seed, one row per (seed, split, policy):
+                     split 'val' is the held-out bank paths and 'oos' the real-price
+                     backtest; policy 'agent' is the trained agent, and the benchmarks
+                     'ew' (equal weight, rebalanced) and 'bh' (equal weight, buy and hold)
+                     have a blank seed
+    seed<N>/run_meta.json    settings, fitted nu parameters and the feasibility check
+    seed<N>/rtd3_final.pt    final agent
+    seed<N>/rtd3_final.png   wealth, weights and drawdown of the final backtest
 """
 import json
 import os
@@ -21,27 +22,19 @@ from datetime import datetime
 from typing import Optional
 
 import numpy as np
-import pandas as pd
 import torch
 
 import config_rtd3 as cfg
 from agent.nu_fit import assert_box_negligible, fit_nu_stocks
 from agent.nu_sampler import NuSampler
 from agent.RTD3 import RTD3
-from env.common import PortfolioModel
+from env.common import PortfolioModel, append_results
 from env.features import StateSpec
 from env.stocks import (PathBankEnv, bank_buy_hold_policy, bank_ew_rebalanced_policy,
                         ebar_fraction, evaluate_on_bank, insample_correlation, load_path_bank,
                         simulate_agent_stocks, split_bank, train_rtd3_bank)
 
 INSAMPLE_END = '2021-06-30'
-VAL_NAMES = {'val_mean_final_wealth': 'final_wealth',
-             'val_mean_final_log_wealth': 'final_log_wealth',
-             'val_mean_sharpe': 'sharpe',
-             'val_mean_vol': 'volatility',
-             'val_mean_sortino': 'sortino'}
-
-
 def set_global_seeds(seed: int):
     """Seed Python, numpy and torch global RNGs.
 
@@ -51,18 +44,6 @@ def set_global_seeds(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
-
-def rename_val(val: dict) -> dict:
-    """Rename evaluate_on_bank outputs to the backtest metric names.
-
-    Args:
-        val: Output of evaluate_on_bank.
-
-    Returns:
-        Dict with keys final_wealth, final_log_wealth, sharpe, volatility, sortino.
-    """
-    return {name: val[key] for key, name in VAL_NAMES.items()}
 
 
 class StocksSetup:
@@ -120,15 +101,11 @@ class StocksSetup:
         """Evaluate the equal-weight rebalanced and buy-and-hold policies on the validation paths.
 
         Returns:
-            Dict of 'ew_' and 'bh_' prefixed metrics.
+            Dict {'ew': metrics, 'bh': metrics}.
         """
-        out = {}
-        for prefix, policy in (('ew', bank_ew_rebalanced_policy(self.seq_dim)),
-                               ('bh', bank_buy_hold_policy(self.seq_dim))):
-            m = rename_val(evaluate_on_bank(policy, self.bank, self.val_idx, self.model))
-            out.update({f'{prefix}_{"log_wealth" if k == "final_log_wealth" else k}': v
-                        for k, v in m.items()})
-        return out
+        return {name: evaluate_on_bank(policy, self.bank, self.val_idx, self.model)
+                for name, policy in (('ew', bank_ew_rebalanced_policy(self.seq_dim)),
+                                     ('bh', bank_buy_hold_policy(self.seq_dim)))}
 
 
 def build_agent(setup: StocksSetup, seed: int) -> RTD3:
@@ -200,30 +177,31 @@ def write_run_meta(log_dir: str, setup: StocksSetup, seed: int, fracs: dict):
         json.dump(meta, f, indent=2, default=str)
 
 
-def run_once(setup: StocksSetup, seed: int, log_dir: str):
+def run_once(setup: StocksSetup, seed: int, log_dir: str) -> dict:
     """Train and evaluate one seed.
 
     Args:
         setup: Shared setup.
         seed: Seed of the run.
         log_dir: Output directory.
+
+    Returns:
+        Nested dict {split: {policy: metrics}} of the final evaluations.
     """
     agent = build_agent(setup, seed)
     env = setup.make_env(seed)
-    agent = train_rtd3_bank(agent, env, cfg.N_EPISODES, log_dir, setup.tickers, cfg.CSV_PATH,
-                            setup.bank, setup.val_idx, cfg.VAL_EVERY, cfg.OOS_EVERY)
+    agent = train_rtd3_bank(agent, env, cfg.N_EPISODES)
     agent.save_agent(f'{log_dir}/rtd3_final.pt')
     agent.training_mode = False
 
     oos = simulate_agent_stocks(agent, setup.tickers, cfg.CSV_PATH, setup.model, benchmarks=True,
                                 fig_path=f'{log_dir}/rtd3_final.png')
-    pd.DataFrame(oos, index=[0]).to_csv(f'{log_dir}/oos_final.csv', index=False)
-    val = rename_val(evaluate_on_bank(lambda s: agent.get_action(s, deterministic=True),
-                                      setup.bank, setup.val_idx, setup.model))
-    val.update(setup.val_benchmarks())
-    pd.DataFrame(val, index=[0]).to_csv(f'{log_dir}/val_final.csv', index=False)
-    print(f'final backtest wealth {oos["final_wealth"]:.4f}, '
-          f'final validation wealth {val["final_wealth"]:.4f}')
+    val = {'agent': evaluate_on_bank(lambda s: agent.get_action(s, deterministic=True),
+                                     setup.bank, setup.val_idx, setup.model),
+           **setup.val_benchmarks()}
+    print(f'final log return p.a.: validation {val["agent"]["log_return_pa"]:.4f}, '
+          f'backtest {oos["agent"]["log_return_pa"]:.4f}')
+    return {'val': val, 'oos': oos}
 
 
 def main(root: Optional[str] = None):
@@ -237,13 +215,20 @@ def main(root: Optional[str] = None):
     fracs = check_feasibility(setup, seeds) if cfg.ROBUST else {}
     name = 'RTD3' if cfg.ROBUST else 'TD3'
     root = root or f'runs/{name}_stocks_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
+    os.makedirs(root, exist_ok=True)
+    results_path = f'{root}/results.csv'
+    if os.path.exists(results_path):
+        os.remove(results_path)
+    ids = {'model': name, 'epsilon': cfg.EPSILON if cfg.ROBUST else None,
+           'delta': cfg.DELTA if cfg.ROBUST else None}
     for seed in seeds:
         log_dir = f'{root}/seed{seed}'
         os.makedirs(log_dir, exist_ok=True)
         print(f'===== seed {seed} -> {log_dir} =====')
         set_global_seeds(seed)
         write_run_meta(log_dir, setup, seed, fracs)
-        run_once(setup, seed, log_dir)
+        results = run_once(setup, seed, log_dir)
+        append_results(results_path, ids, seed, results, benchmarks=seed == seeds[0])
 
 
 if __name__ == '__main__':

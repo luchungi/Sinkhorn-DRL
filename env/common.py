@@ -1,4 +1,6 @@
 """Portfolio accounting and performance metrics shared by the environments and agents."""
+import os
+
 import numpy as np
 import pandas as pd
 import torch
@@ -92,6 +94,56 @@ def drawdown_backward(levels: pd.Series) -> pd.Series:
     arr = levels.to_numpy(dtype=float)
     return pd.Series(arr / np.maximum.accumulate(arr, axis=-1) - 1.0,
                      index=levels.index, name=levels.name)
+
+
+METRICS = ('log_return_pa', 'max_drawdown', 'volatility', 'down_deviation', 'sortino', 'sharpe')
+
+
+def summary_metrics(log_returns, rf, years: float) -> dict:
+    """Compute path-averaged performance metrics from per-period portfolio log returns.
+
+    Args:
+        log_returns: Log returns of shape (T,) or (n_paths, T).
+        rf: Risk-free log return per period, scalar or of shape (T,).
+        years: Length of the evaluation period in years.
+
+    Returns:
+        Dict with the keys of METRICS, each the mean over paths.
+    """
+    r = np.atleast_2d(np.asarray(log_returns, dtype=float))
+    log_wealth = np.concatenate([np.zeros((r.shape[0], 1)), r.cumsum(axis=1)], axis=1)
+    wealth = np.exp(log_wealth)
+    max_drawdown = (wealth / np.maximum.accumulate(wealth, axis=1) - 1.0).min(axis=1)
+    vol, sharpe, downside, sortino = perf_metrics(r - rf, axis=1)
+    return {'log_return_pa': float(np.mean(log_wealth[:, -1] / years)),
+            'max_drawdown': float(np.mean(max_drawdown)),
+            'volatility': float(np.mean(vol)),
+            'down_deviation': float(np.mean(downside)),
+            'sortino': float(np.mean(sortino)),
+            'sharpe': float(np.mean(sharpe))}
+
+
+def append_results(path: str, ids: dict, seed: int, results: dict, benchmarks: bool):
+    """Append the evaluation rows of one seed to a results CSV.
+
+    Args:
+        path: CSV file; the header is written if the file is new.
+        ids: Identifying columns written first on every row (model, epsilon, delta).
+        seed: Seed of the agent rows.
+        results: Nested dict {split: {policy: metrics}}, where policy 'agent' is the
+            trained agent and every other policy is a seed-independent benchmark.
+        benchmarks: Also write the benchmark rows, with a blank seed.
+    """
+    rows = []
+    for split, by_policy in results.items():
+        for policy, metrics in by_policy.items():
+            if policy == 'agent' or benchmarks:
+                rows.append({**ids, 'seed': seed if policy == 'agent' else None,
+                             'split': split, 'policy': policy,
+                             **{k: metrics[k] for k in METRICS}})
+    rows.sort(key=lambda row: row['policy'] == 'agent')
+    df = pd.DataFrame(rows).astype({'seed': 'Int64'})
+    df.to_csv(path, index=False, mode='a', header=not os.path.exists(path))
 
 
 def gross_return(action: torch.Tensor, non_cash_return: torch.Tensor,

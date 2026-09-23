@@ -1,5 +1,4 @@
 """Path-bank portfolio environment, evaluation on real prices and the RTD3 training loop."""
-import os
 from typing import Callable, Optional
 
 import matplotlib.pyplot as plt
@@ -8,7 +7,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from env.common import PortfolioModel, drawdown_backward, perf_metrics, rf_log_return
+from env.common import PortfolioModel, drawdown_backward, rf_log_return, summary_metrics
 from env.plot import overview
 
 DATATYPE = torch.float32
@@ -203,12 +202,6 @@ def ebar_fraction(returns: torch.Tensor, sampler, epsilon: float, delta: float,
     return (torch.cat(ebar) > 0).float().mean().item()
 
 
-def _append_csv(path: str, row: dict):
-    """Append one row to a CSV file, writing the header if the file is new."""
-    pd.DataFrame(row, index=[0]).to_csv(path, index=False, mode='a',
-                                        header=not os.path.exists(path))
-
-
 def simulate_agent_stocks(agent, tickers: list, csv_path: str, model: PortfolioModel,
                           start_date: str = '2021-07-01', benchmarks: bool = False,
                           fig_path: Optional[str] = None) -> dict:
@@ -225,7 +218,8 @@ def simulate_agent_stocks(agent, tickers: list, csv_path: str, model: PortfolioM
         fig_path: File for the overview figure; no figure if None.
 
     Returns:
-        Dict with final_wealth, max_drawdown, sharpe, volatility and sortino.
+        Dict {'agent': metrics}, plus 'ew' and 'bh' with benchmarks, with the keys of
+        METRICS.
     """
     prices, log_returns = load_stock_returns(csv_path, tickers)
     spec = model.spec
@@ -272,18 +266,10 @@ def simulate_agent_stocks(agent, tickers: list, csv_path: str, model: PortfolioM
         fig.savefig(fig_path, dpi=300, facecolor=fig.get_facecolor())
         plt.close(fig)
 
-    def metrics(name: str) -> dict:
-        excess = np.diff(series[name]) - rf_log_return(model.int_rate, DT)
-        vol, sharpe, _, sortino = perf_metrics(excess)
-        return {'final_wealth': float(df[name].iloc[-1]),
-                'max_drawdown': float(df[f'{name}_mdd'].min()),
-                'sharpe': float(sharpe), 'volatility': float(vol), 'sortino': float(sortino)}
-
-    result = metrics('agent')
-    if benchmarks:
-        for prefix, name in (('ew', 'ew_rebalanced'), ('bh', 'ew_buy_hold')):
-            result.update({f'{prefix}_{k}': v for k, v in metrics(name).items()})
-    return result
+    years = (df.index[-1] - df.index[0]).days / 365
+    return {name: summary_metrics(np.diff(series[key]), rf_log_return(model.int_rate, DT), years)
+            for name, key in (('agent', 'agent'), ('ew', 'ew_rebalanced'), ('bh', 'ew_buy_hold'))
+            if key in series}
 
 
 def bank_ew_rebalanced_policy(seq_dim: int) -> Callable:
@@ -327,8 +313,7 @@ def evaluate_on_bank(policy_fn: Callable, bank: dict, path_indices: np.ndarray,
         model: PortfolioModel pricing the trades.
 
     Returns:
-        Dict of path-averaged final wealth, final log wealth, Sharpe ratio, Sortino
-        ratio and volatility.
+        Dict with the keys of METRICS, each averaged over paths.
     """
     env = PathBankEnv(bank, model, path_indices, batch_size=len(path_indices), seed=0)
     states = env.reset(paths=path_indices)
@@ -340,43 +325,23 @@ def evaluate_on_bank(policy_fn: Callable, bank: dict, path_indices: np.ndarray,
         states, rewards, done = env.step(actions)
         rewards_seq.append(rewards)
     rewards = torch.cat(rewards_seq, dim=1) / model.reward_scale
-    final_log_wealth = rewards.sum(dim=1)
-    excess = rewards.detach().cpu().numpy() - rf_log_return(model.int_rate, DT)
-    vol, sharpe, _, sortino = perf_metrics(excess, axis=1)
-    return {'val_mean_final_wealth': final_log_wealth.exp().mean().item(),
-            'val_mean_final_log_wealth': final_log_wealth.mean().item(),
-            'val_mean_sharpe': float(sharpe.mean()),
-            'val_mean_sortino': float(sortino.mean()),
-            'val_mean_vol': float(vol.mean())}
+    return summary_metrics(rewards.detach().cpu().numpy(), rf_log_return(model.int_rate, DT),
+                           rewards.shape[1] * DT)
 
 
-def train_rtd3_bank(agent, env: PathBankEnv, n_episodes: int, log_dir: str, tickers: list,
-                    csv_path: str, val_bank: dict, val_indices: np.ndarray,
-                    val_every: int, oos_every: int):
-    """Train an agent on the path bank with periodic validation and real-data backtests.
-
-    Every oos_every episodes a backtest row is appended to oos_monitor.csv. Every
-    val_every episodes a validation row is appended to val.csv and the agent is saved
-    to rtd3_<episode>.pt.
+def train_rtd3_bank(agent, env: PathBankEnv, n_episodes: int):
+    """Train an agent on the path bank.
 
     Args:
         agent: RTD3 agent.
         env: Training environment.
         n_episodes: Number of episodes.
-        log_dir: Output directory.
-        tickers: Tickers in bank order.
-        csv_path: Price CSV for the backtests.
-        val_bank: Path bank used for validation.
-        val_indices: Validation path indices.
-        val_every: Episodes between validations.
-        oos_every: Episodes between backtests.
 
     Returns:
         The trained agent.
     """
     pbar = tqdm(range(n_episodes), desc='RTD3', unit='ep')
-    last_val_wealth = float('nan')
-    for episode in pbar:
+    for _ in pbar:
         cum_rewards = torch.zeros(env.batch_size, 1)
         obs = env.reset()
         action = agent.agent_start(obs)
@@ -387,23 +352,5 @@ def train_rtd3_bank(agent, env: PathBankEnv, n_episodes: int, log_dir: str, tick
                 agent.agent_end(rewards, obs)
                 break
             action = agent.agent_step(rewards, obs)
-
-        ep = episode + 1
-        oos = None
-        if ep % oos_every == 0:
-            oos = simulate_agent_stocks(agent, tickers, csv_path, env.model)
-            oos['episodes_trained'] = ep
-            _append_csv(f'{log_dir}/oos_monitor.csv', oos)
-        if ep % val_every == 0:
-            val = evaluate_on_bank(lambda s: agent.get_action(s, deterministic=True),
-                                   val_bank, val_indices, env.model)
-            val['episodes_trained'] = ep
-            _append_csv(f'{log_dir}/val.csv', val)
-            agent.save_agent(f'{log_dir}/rtd3_{ep}.pt')
-            last_val_wealth = val['val_mean_final_wealth']
-            msg = f'[ep {ep}] val_wealth={last_val_wealth:.4f} val_sortino={val["val_mean_sortino"]:.3f}'
-            if oos is not None:
-                msg += f' oos_wealth={oos["final_wealth"]:.3f}'
-            tqdm.write(msg)
-        pbar.set_postfix(cum_r=f'{cum_rewards.mean():.2f}', val_w=f'{last_val_wealth:.4f}')
+        pbar.set_postfix(cum_r=f'{cum_rewards.mean():.2f}')
     return agent

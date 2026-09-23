@@ -49,8 +49,6 @@ HIDDEN = [128, 128]       # hidden layer widths of the actor and critics
 ACTIVATION = 'relu'       # hidden layer activation, 'relu' or 'tanh'
 ACTOR_LR = 1e-4           # actor learning rate
 CRITIC_LR = 1e-4          # critic learning rate
-VAL_EVERY = 5             # episodes between validations on held-out paths (also saves the agent)
-OOS_EVERY = 5             # episodes between backtests on real prices
 DEVICE = 'cpu'            # torch device
 
 # ---------------------------------------------------------------------------

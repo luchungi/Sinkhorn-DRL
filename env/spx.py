@@ -1,7 +1,7 @@
 """SPX environment driven by a pretrained LSTM generator, real-SPX backtest and the DQN training loop."""
 import json
 import os
-from typing import Callable, Optional
+from typing import Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from env.common import PortfolioModel, drawdown_backward, perf_metrics, rf_log_return
+from env.common import PortfolioModel, drawdown_backward, rf_log_return, summary_metrics
 from env.features import ANN, StateSpec
 from env.plot import overview
 
@@ -221,28 +221,20 @@ class MMDSimulator:
         return torch.cat(noise, dim=2).permute(0, 2, 1)
 
     def evaluation_metrics(self) -> dict:
-        """Summarise a logged episode for the agent ('eval_') and for holding SPX ('env_').
+        """Summarise a logged episode for the agent and for holding SPX.
 
         Returns:
-            Dict of path-averaged final log wealth, final wealth, volatility, Sharpe
-            ratio, downside deviation and Sortino ratio.
+            Dict {'agent': metrics, 'simulator': metrics} with the keys of METRICS,
+            each averaged over paths.
         """
         rewards = torch.cat(self.episode_rewards, dim=1)
         market = torch.cat(self.episode_log_returns, dim=1)
         step0 = BURN_IN + STATE_LEN
         dt = self.dts[step0:step0 + rewards.shape[1]].detach().cpu().numpy()
         rf = rf_log_return(self.model.int_rate, dt)
-        out = {}
-        for prefix, log_returns in (('eval', rewards), ('env', market)):
-            final_log_wealth = log_returns.sum(dim=1)
-            vol, sharpe, downside, sortino = perf_metrics(log_returns.detach().cpu().numpy() - rf, axis=1)
-            out.update({f'{prefix}_mean_final_log_wealth': final_log_wealth.mean(dim=0).item(),
-                        f'{prefix}_mean_final_wealth': final_log_wealth.exp().mean(dim=0).item(),
-                        f'{prefix}_mean_return_vol': float(vol.mean()),
-                        f'{prefix}_mean_sharpe': float(sharpe.mean()),
-                        f'{prefix}_mean_downside_dev': float(downside.mean()),
-                        f'{prefix}_mean_sortino': float(sortino.mean())})
-        return out
+        years = float(dt.sum())
+        return {'agent': summary_metrics(rewards.detach().cpu().numpy(), rf, years),
+                'simulator': summary_metrics(market.detach().cpu().numpy(), rf, years)}
 
 
 def simulate_agent_spx(q: nn.Module, action_values: torch.Tensor, csv_path: str,
@@ -263,7 +255,8 @@ def simulate_agent_spx(q: nn.Module, action_values: torch.Tensor, csv_path: str,
         fig_path: File for the overview figure; no figure if None.
 
     Returns:
-        Dict of agent metrics and 'spx_'-prefixed buy-and-hold metrics.
+        Dict {'agent': metrics, 'spx': metrics} for the agent and for holding SPX,
+        with the keys of METRICS.
     """
     spec = spx_spec()
     hist_len = spec.state_len
@@ -309,38 +302,20 @@ def simulate_agent_spx(q: nn.Module, action_values: torch.Tensor, csv_path: str,
         plt.close(fig)
 
     rf_dt = dt[hist_len + 1:]
-    agent_excess = np.asarray(np.diff(log_wealth_seq), dtype=float) - rf_log_return(int_rate, rf_dt)
-    vol, sharpe, downside, sortino = perf_metrics(agent_excess)
-    spx_returns = spx_df.iloc[hist_len + 1:, ret_col].values
-    spx_vol, spx_sharpe, spx_downside, spx_sortino = perf_metrics(
-        np.asarray(spx_returns, dtype=float) - rf_log_return(int_rate, rf_dt))
-    return {'final_wealth': float(spx_df['agent'].iloc[-1]),
-            'final_log_wealth': float(log_wealth_seq[-1]),
-            'max_drawdown': float(spx_df['agent_max_drawdown'].min()),
-            'sharpe': float(sharpe), 'volatility': float(vol),
-            'down_deviation': float(downside), 'sortino': float(sortino),
-            'spx_final_wealth': float(spx_df['spx_normalised'].iloc[-1]),
-            'spx_final_log_wealth': float(np.log(spx_df['spx_normalised'].iloc[-1])),
-            'spx_max_drawdown': float(spx_df['spx_max_drawdown'].min()),
-            'spx_sharpe': float(spx_sharpe), 'spx_volatility': float(spx_vol),
-            'spx_down_deviation': float(spx_downside), 'spx_sortino': float(spx_sortino)}
+    rf = rf_log_return(int_rate, rf_dt)
+    years = float(rf_dt.sum())
+    spx_returns = np.asarray(spx_df.iloc[hist_len + 1:, ret_col].values, dtype=float)
+    return {'agent': summary_metrics(np.diff(log_wealth_seq), rf, years),
+            'spx': summary_metrics(spx_returns, rf, years)}
 
 
-def train_robustdqn(agent, env: MMDSimulator, n_episodes: int, log_dir: str,
-                    backtest: Callable[[], dict], oos_every: int, ckpt_prefix: str):
+def train_robustdqn(agent, env: MMDSimulator, n_episodes: int):
     """Train a DQN agent on the simulator.
-
-    After every episode the Q-network is saved to <ckpt_prefix>_<episode>.pt, and every
-    oos_every episodes a backtest row is appended to spx.csv.
 
     Args:
         agent: DQN or RobustDQN agent.
         env: Training environment.
         n_episodes: Number of episodes.
-        log_dir: Output directory.
-        backtest: Callable returning the real-SPX backtest metrics.
-        oos_every: Episodes between backtests.
-        ckpt_prefix: Prefix of the checkpoint files.
 
     Returns:
         The trained agent.
@@ -354,13 +329,6 @@ def train_robustdqn(agent, env: MMDSimulator, n_episodes: int, log_dir: str,
             cum_rewards += rewards
             if done:
                 agent.agent_end(rewards, obs)
-                if (episode + 1) % oos_every == 0:
-                    metrics = backtest()
-                    metrics['episodes_trained'] = episode + 1
-                    path = f'{log_dir}/spx.csv'
-                    pd.DataFrame(metrics, index=[0]).to_csv(path, index=False, mode='a',
-                                                            header=not os.path.exists(path))
-                torch.save(agent.q.state_dict(), f'{log_dir}/{ckpt_prefix}_{episode + 1}.pt')
                 break
             act_idx = agent.agent_step(rewards, obs)
         print(f'Episode {episode + 1} mean of summed rewards: {cum_rewards.mean():.3f}')

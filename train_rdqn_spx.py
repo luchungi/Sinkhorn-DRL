@@ -5,13 +5,14 @@ Settings are read from config_rdqn.py.
 Usage:
     python train_rdqn_spx.py
 
-Outputs per seed in runs/<RDQN|DQN>_spx_<timestamp>/seed<N>/:
-    run_meta.json    settings and the feasibility check
-    spx.csv          real-SPX backtest metrics every OOS_EVERY episodes
-    <rdqn|dqn>_<ep>.pt  Q-network after every episode, and <rdqn|dqn>_final.pt
-    sim_eval.csv     final evaluation on EVAL_BATCH_SIZE simulated paths
-    oos_final.csv    final real-SPX backtest
-    spx_oos.png      wealth, weights and drawdown of the final backtest
+Outputs in runs/<RDQN|DQN>_spx_<timestamp>/:
+    results.csv      final-weight metrics of every seed, one row per (seed, split, policy):
+                     split 'val' is EVAL_BATCH_SIZE simulated paths and 'oos' the real-SPX
+                     backtest; policy 'agent' is the trained agent, and the benchmarks
+                     'simulator' (val) and 'spx' (oos) hold SPX and have a blank seed
+    seed<N>/run_meta.json         settings and the feasibility check
+    seed<N>/<rdqn|dqn>_final.pt   final Q-network
+    seed<N>/spx_oos.png           wealth, weights and drawdown of the final backtest
 """
 import json
 import os
@@ -20,13 +21,13 @@ from datetime import datetime
 from typing import Optional
 
 import numpy as np
-import pandas as pd
 import torch
 
 import config_rdqn as cfg
 from agent.DQN import DQN, RobustDQN
 from agent.nu_sampler import NuSampler
 from agent.q import QFunc
+from env.common import append_results
 from env.spx import MMDSimulator, load_generator, simulate_agent_spx, spx_spec, train_robustdqn
 from env.stocks import ebar_fraction
 
@@ -173,24 +174,21 @@ def write_run_meta(log_dir: str, setup: SpxSetup, seed: int, fracs: dict):
         json.dump(meta, f, indent=2, default=str)
 
 
-def run_once(setup: SpxSetup, seed: int, log_dir: str):
+def run_once(setup: SpxSetup, seed: int, log_dir: str) -> dict:
     """Train and evaluate one seed.
 
     Args:
         setup: Shared setup.
         seed: Seed of the run.
         log_dir: Output directory.
+
+    Returns:
+        Nested dict {split: {policy: metrics}} of the final evaluations.
     """
     prefix = 'rdqn' if cfg.ROBUST else 'dqn'
     env = setup.make_env(cfg.ENV_BATCH_SIZE)
     agent = build_agent(setup, seed, env)
-
-    def backtest(fig_path=None):
-        return simulate_agent_spx(agent.q, setup.action_values, cfg.SPX_CSV_PATH,
-                                  cfg.SPX_EVAL_START_DATE, cfg.SPX_EVAL_END_DATE, cfg.INT_RATE,
-                                  cfg.TRANS_COST, fig_path=fig_path)
-
-    agent = train_robustdqn(agent, env, cfg.N_EPISODES, log_dir, backtest, cfg.OOS_EVERY, prefix)
+    agent = train_robustdqn(agent, env, cfg.N_EPISODES)
     torch.save(agent.q.state_dict(), f'{log_dir}/{prefix}_final.pt')
 
     agent.training_mode = False
@@ -204,11 +202,14 @@ def run_once(setup: SpxSetup, seed: int, log_dir: str):
         if done:
             break
         action = agent.get_action(obs)
-    pd.DataFrame(eval_env.evaluation_metrics(), index=[0]).to_csv(f'{log_dir}/sim_eval.csv', index=False)
+    val = eval_env.evaluation_metrics()
 
-    oos = backtest(f'{log_dir}/spx_oos.png')
-    pd.DataFrame(oos, index=[0]).to_csv(f'{log_dir}/oos_final.csv', index=False)
-    print(f'final backtest wealth {oos["final_wealth"]:.4f}, sortino {oos["sortino"]:.4f}')
+    oos = simulate_agent_spx(agent.q, setup.action_values, cfg.SPX_CSV_PATH,
+                             cfg.SPX_EVAL_START_DATE, cfg.SPX_EVAL_END_DATE, cfg.INT_RATE,
+                             cfg.TRANS_COST, fig_path=f'{log_dir}/spx_oos.png')
+    print(f'final log return p.a.: validation {val["agent"]["log_return_pa"]:.4f}, '
+          f'backtest {oos["agent"]["log_return_pa"]:.4f}')
+    return {'val': val, 'oos': oos}
 
 
 def main(root: Optional[str] = None):
@@ -222,13 +223,20 @@ def main(root: Optional[str] = None):
     fracs = check_feasibility(setup, seeds) if cfg.ROBUST else {}
     name = 'RDQN' if cfg.ROBUST else 'DQN'
     root = root or f'runs/{name}_spx_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
+    os.makedirs(root, exist_ok=True)
+    results_path = f'{root}/results.csv'
+    if os.path.exists(results_path):
+        os.remove(results_path)
+    ids = {'model': name, 'epsilon': cfg.EPSILON if cfg.ROBUST else None,
+           'delta': cfg.DELTA if cfg.ROBUST else None}
     for seed in seeds:
         log_dir = f'{root}/seed{seed}'
         os.makedirs(log_dir, exist_ok=True)
         print(f'===== seed {seed} -> {log_dir} =====')
         set_global_seeds(seed)
         write_run_meta(log_dir, setup, seed, fracs)
-        run_once(setup, seed, log_dir)
+        results = run_once(setup, seed, log_dir)
+        append_results(results_path, ids, seed, results, benchmarks=seed == seeds[0])
 
 
 if __name__ == '__main__':
